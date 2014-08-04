@@ -45,6 +45,10 @@ from libcloud.compute.base import (NodeDriver, Node, NodeLocation,
                                    StorageVolume, VolumeSnapshot)
 from libcloud.compute.base import KeyPair
 from libcloud.compute.types import NodeState, Provider
+from libcloud.networking.drivers.openstack import \
+    OpenStackNeutronNetworkingDriver, OpenStackQuantumNetworkingDriver, \
+    OpenStackNovaNetworkingDriver
+from libcloud.networking.base import Network, Subnet
 from libcloud.pricing import get_size_price
 from libcloud.utils.xml import findall
 
@@ -1146,13 +1150,46 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
     connectionCls = OpenStack_1_1_Connection
     type = Provider.OPENSTACK
 
-    features = {"create_node": ["generates_password"]}
+    features = {'create_node': ['generates_password']}
     _networks_url_prefix = '/os-networks'
 
     def __init__(self, *args, **kwargs):
         self._ex_force_api_version = str(kwargs.pop('ex_force_api_version',
                                                     None))
         super(OpenStack_1_1_NodeDriver, self).__init__(*args, **kwargs)
+        self._networking_driver = None
+
+    def get_networking_driver(self):
+        """
+        Retrieve an instance of a networking driver for this account.
+        """
+        # TODO: Add support for obtaining a particular networking driver
+        # TODO: We probably shouldn't re-use the same connection by default
+        # because this breaks our "every driver instance is thread safe"
+        # guarantee
+        if not self._networking_driver:
+            catalog = self.connection.get_service_catalog()
+            service_names = catalog.get_service_names(service_type='network')
+
+            kwargs = {}
+            if 'neutron' in service_names:
+                cls = OpenStackNeutronNetworkingDriver
+            elif 'quantum' in service_names:
+                cls = OpenStackQuantumNetworkingDriver
+            else:
+                # Neutron / Quantum not available, default to Nova networking
+                cls = OpenStackNovaNetworkingDriver
+
+                # For nova, we just want to re-use the compute driver base url
+                kwargs['ex_force_base_url'] = self.connection._base_url
+                kwargs['api_path'] = self._networks_url_prefix
+
+            self._networking_driver = cls(key=self.key, secret=self.secret,
+                                          region=self.region,
+                                          ex_clone_connection=self.connection,
+                                          **kwargs)
+
+        return self._networking_driver
 
     def create_node(self, **kwargs):
         """Create a new node
@@ -1504,24 +1541,14 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
         updates = {'name': potential_data['name']}
         return self._update_node(node, **updates)
 
-    def _to_networks(self, obj):
-        networks = obj['networks']
-        return [self._to_network(network) for network in networks]
-
-    def _to_network(self, obj):
-        return OpenStackNetwork(id=obj['id'],
-                                name=obj['label'],
-                                cidr=obj.get('cidr', None),
-                                driver=self)
-
     def ex_list_networks(self):
         """
         Get a list of Networks that are available.
 
         :rtype: ``list`` of :class:`OpenStackNetwork`
         """
-        response = self.connection.request(self._networks_url_prefix).object
-        return self._to_networks(response)
+        networking_driver = self.get_networking_driver()
+        return networking_driver.list_networks()
 
     def ex_create_network(self, name, cidr):
         """
@@ -1535,10 +1562,13 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         :rtype: :class:`OpenStackNetwork`
         """
-        data = {'network': {'cidr': cidr, 'label': name}}
-        response = self.connection.request(self._networks_url_prefix,
-                                           method='POST', data=data).object
-        return self._to_network(response['network'])
+        networking_driver = self.get_networking_driver()
+
+        network = Network(name=name)
+        subnets = [Subnet(ip_version=4, cidr=cidr)]
+        network = networking_driver.create_network(network=network,
+                                                   subnets=subnets)
+        return network
 
     def ex_delete_network(self, network):
         """
@@ -1549,10 +1579,8 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         :rtype: ``bool``
         """
-        resp = self.connection.request('%s/%s' % (self._networks_url_prefix,
-                                                  network.id),
-                                       method='DELETE')
-        return resp.status == httplib.ACCEPTED
+        networking_driver = self.get_networking_driver()
+        return networking_driver.delete_network(network=network)
 
     def ex_get_console_output(self, node, length=None):
         """
@@ -2137,8 +2165,8 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         :rtype: ``list`` of :class:`OpenStack_1_1_FloatingIpAddress`
         """
-        return self._to_floating_ips(
-            self.connection.request('/os-floating-ips').object)
+        networking_driver = self.get_networking_driver()
+        return networking_driver.list_floating_ips()
 
     def ex_get_floating_ip(self, ip):
         """
@@ -2159,17 +2187,8 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         :rtype: :class:`OpenStack_1_1_FloatingIpAddress`
         """
-        resp = self.connection.request('/os-floating-ips',
-                                       method='POST',
-                                       data={})
-        data = resp.object['floating_ip']
-        id = data['id']
-        ip_address = data['ip']
-        return OpenStack_1_1_FloatingIpAddress(id=id,
-                                               ip_address=ip_address,
-                                               pool=None,
-                                               node_id=None,
-                                               driver=self)
+        networking_driver = self.get_networking_driver()
+        return networking_driver.create_floating_ip()
 
     def ex_delete_floating_ip(self, ip):
         """
@@ -2180,9 +2199,8 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         :rtype: ``bool``
         """
-        resp = self.connection.request('/os-floating-ips/%s' % ip.id,
-                                       method='DELETE')
-        return resp.status in (httplib.NO_CONTENT, httplib.ACCEPTED)
+        networking_driver = self.get_networking_driver()
+        return networking_driver.delete_floating_ip(floating_ip=ip)
 
     def ex_attach_floating_ip_to_node(self, node, ip):
         """
@@ -2196,13 +2214,9 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         :rtype: ``bool``
         """
-        address = ip.ip_address if hasattr(ip, 'ip_address') else ip
-        data = {
-            'addFloatingIp': {'address': address}
-        }
-        resp = self.connection.request('/servers/%s/action' % node.id,
-                                       method='POST', data=data)
-        return resp.status == httplib.ACCEPTED
+        networking_driver = self.get_networking_driver()
+        return networking_driver.attach_floating_ip_to_node(node=node,
+                                                            floating_ip=ip)
 
     def ex_detach_floating_ip_from_node(self, node, ip):
         """
@@ -2216,13 +2230,9 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         :rtype: ``bool``
         """
-        address = ip.ip_address if hasattr(ip, 'ip_address') else ip
-        data = {
-            'removeFloatingIp': {'address': address}
-        }
-        resp = self.connection.request('/servers/%s/action' % node.id,
-                                       method='POST', data=data)
-        return resp.status == httplib.ACCEPTED
+        networking_driver = self.get_networking_driver()
+        return networking_driver.detatch_floating_ip_from_node(node=node,
+                                                               floating_ip=ip)
 
     def ex_get_metadata_for_node(self, node):
         """
