@@ -77,21 +77,6 @@ class OpenStackComputeConnection(OpenStackBaseConnection):
     service_name = 'nova'
     service_region = 'RegionOne'
 
-    def request(self, action, params=None, data='', headers=None,
-                method='GET'):
-        if not headers:
-            headers = {}
-        if not params:
-            params = {}
-
-        if method in ("POST", "PUT"):
-            headers = {'Content-Type': self.default_content_type}
-
-        return super(OpenStackComputeConnection, self).request(
-            action=action,
-            params=params, data=data,
-            method=method, headers=headers)
-
 
 class OpenStackNodeDriver(NodeDriver, OpenStackDriverMixin):
     """
@@ -972,22 +957,20 @@ class OpenStack_1_1_Response(OpenStackResponse):
         super(OpenStack_1_1_Response, self).__init__(*args, **kwargs)
 
 
-class OpenStackNetwork(object):
+class OpenStackNetwork(Network):
     """
     A Virtual Network.
     """
 
     def __init__(self, id, name, cidr, driver, extra=None):
-        self.id = str(id)
-        self.name = name
+        super(OpenStackNetwork, self).__init__(id=id, name=name, extra=extra,
+                                               driver=driver)
         self.cidr = cidr
-        self.driver = driver
-        self.extra = extra or {}
 
     def __repr__(self):
-        return '<OpenStackNetwork id="%s" name="%s" cidr="%s">' % (self.id,
-                                                                   self.name,
-                                                                   self.cidr,)
+        return '<OpenStackNetwork id=%s name=%s cidr=%s>' % (self.id,
+                                                             self.name,
+                                                             self.cidr)
 
 
 class OpenStackSecurityGroup(object):
@@ -1163,7 +1146,6 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
         """
         Retrieve an instance of a networking driver for this account.
         """
-        # TODO: Add support for obtaining a particular networking driver
         # TODO: We probably shouldn't re-use the same connection by default
         # because this breaks our "every driver instance is thread safe"
         # guarantee
@@ -1171,25 +1153,50 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
             catalog = self.connection.get_service_catalog()
             service_names = catalog.get_service_names(service_type='network')
 
-            kwargs = {}
             if 'neutron' in service_names:
-                cls = OpenStackNeutronNetworkingDriver
+                driver_type = 'neutron'
             elif 'quantum' in service_names:
-                cls = OpenStackQuantumNetworkingDriver
+                driver_type = 'quantum'
             else:
                 # Neutron / Quantum not available, default to Nova networking
-                cls = OpenStackNovaNetworkingDriver
+                driver_type = 'nova'
 
-                # For nova, we just want to re-use the compute driver base url
-                kwargs['ex_force_base_url'] = self.connection._base_url
-                kwargs['api_path'] = self._networks_url_prefix
-
-            self._networking_driver = cls(key=self.key, secret=self.secret,
-                                          region=self.region,
-                                          ex_clone_connection=self.connection,
-                                          **kwargs)
+            driver = self.get_networking_driver_by_type(driver_type)
+            self._networking_driver = driver
 
         return self._networking_driver
+
+    def get_networking_driver_by_type(self, driver_type='nova'):
+        """
+        Retrieve networking driver using a provided type.
+
+        Note: This function does no capability detection and caching so you are
+        encouraged to use ``get_networking_driver`` method.
+
+        :param driver_type: Driver type (nova / neutron / quantum).
+        :type driver_type: ``str``
+        """
+        if driver_type not in ['neutron', 'quantum', 'nova']:
+            raise ValueError('Invalid driver type: %s' % (driver_type))
+
+        kwargs = {}
+
+        if driver_type == 'nova':
+            cls = OpenStackNovaNetworkingDriver
+
+            # For nova, we just want to re-use the compute driver base url
+            kwargs['ex_force_base_url'] = self.connection._base_url
+            kwargs['api_path'] = self._networks_url_prefix
+        elif driver_type == 'neutron':
+            cls = OpenStackNeutronNetworkingDriver
+        elif driver_type == 'quantum':
+            cls = OpenStackQuantumNetworkingDriver
+
+        driver = cls(key=self.key, secret=self.secret,
+                     region=self.region,
+                     ex_clone_connection=self.connection,
+                     **kwargs)
+        return driver
 
     def create_node(self, **kwargs):
         """Create a new node
@@ -1545,10 +1552,27 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
         """
         Get a list of Networks that are available.
 
+        For backward compatibility reasons, cidr is included in the return
+        values.
+
         :rtype: ``list`` of :class:`OpenStackNetwork`
         """
         networking_driver = self.get_networking_driver()
-        return networking_driver.list_networks()
+
+        networks = []
+        for network in networking_driver.iterate_networks():
+            cidr = None
+
+            try:
+                subnet = next(network.iterate_subnets())
+                cidr = subnet.cidr
+            except StopIteration:
+                pass
+
+            network = OpenStackNetwork(id=network.id, name=network.name,
+                                       cidr=cidr, driver=self)
+            networks.append(network)
+        return networks
 
     def ex_create_network(self, name, cidr):
         """
@@ -1565,9 +1589,9 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
         networking_driver = self.get_networking_driver()
 
         network = Network(name=name)
-        subnets = [Subnet(ip_version=4, cidr=cidr)]
+        subnet = Subnet(ip_version=4, cidr=cidr)
         network = networking_driver.create_network(network=network,
-                                                   subnets=subnets)
+                                                   subnet=subnet)
         return network
 
     def ex_delete_network(self, network):

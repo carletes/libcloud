@@ -14,7 +14,7 @@
 # limitations under the License.
 
 try:
-    import simplejson as json
+    import simplejson as json  # pylint: disable=import-error
 except ImportError:
     import json
 
@@ -27,6 +27,9 @@ from libcloud.networking.base import Port, FloatingIP, NetworkGateway
 from libcloud.common.openstack import OpenStackBaseConnection
 from libcloud.common.openstack import OpenStackDriverMixin
 from libcloud.common.openstack import OpenStackResponse
+
+from libcloud.utils.networking import join_ipv4_segments
+from libcloud.utils.networking import increment_ipv4_segments
 
 __all__ = [
     'OpenStackFloatingIP',
@@ -45,11 +48,16 @@ class OpenStackFloatingIP(FloatingIP):
     """
 
     def __init__(self, id, floating_ip_address, fixed_ip_address=None,
-                 network_id=None, port_id=None, driver=None, router_id=None,
-                 tenant_id=None):
-        super(OpenStackFloatingIP, self).__init__(id, floating_ip_address,
-                                                  fixed_ip_address, network_id,
-                                                  port_id, driver)
+                 network_id=None, port_id=None, router_id=None, tenant_id=None,
+                 extra=None, driver=None):
+        super(OpenStackFloatingIP, self).__init__(
+            id=id,
+            floating_ip_address=floating_ip_address,
+            fixed_ip_address=fixed_ip_address,
+            network_id=network_id,
+            port_id=port_id,
+            extra=extra,
+            driver=driver)
         self.router_id = router_id
         self.tenant_id = tenant_id
 
@@ -67,35 +75,6 @@ class OpenStackSubnet(Subnet):
             self.start_ip = start_ip
             self.end_ip = end_ip
 
-        @staticmethod
-        def _join_ip_segments(segments):
-            """
-            Helper method to join ip numeric segment pieces back into a full
-            ip address.
-            """
-            return '.'.join([str(s) for s in segments])
-
-        @staticmethod
-        def _increment_ip_segs(segments):
-            '''
-            Increment an ip address given in quad segments based on ipv4 rules
-            '''
-            segments[3] += 1
-
-            if segments[3] == 256:
-                segments[3] = 0
-                segments[2] += 1
-
-                if segments[2] == 256:
-                    segments[2] = 0
-                    segments[1] += 1
-
-                    if segments[1] == 256:
-                        segments[1] = 0
-                        segments[0] += 1
-
-            return segments
-
         def iterate_ip_addresses(self):
             """
             Generator for all ip addresses in the pool
@@ -103,15 +82,13 @@ class OpenStackSubnet(Subnet):
             current_segs = [int(seg) for seg in self.start_ip.split('.', 3)]
             end_segs = [int(seg) for seg in self.end_ip.split('.', 3)]
 
-            AP = OpenStackSubnet.AllocationPool
-
-            current_ip_addresses = AP._join_ip_segments(current_segs)
-            end_ip_addresses = AP._join_ip_segments(end_segs)
+            current_ip_addresses = join_ipv4_segments(current_segs)
+            end_ip_addresses = join_ipv4_segments(end_segs)
 
             while current_ip_addresses != end_ip_addresses:
-                ip_addresses = AP._join_ip_segments(current_segs)
+                ip_addresses = join_ipv4_segments(current_segs)
                 yield ip_addresses
-                current_segs = AP._increment_ip_segs(current_segs)
+                current_segs = increment_ipv4_segments(current_segs)
 
     def __init__(self, id=None, name=None, ip_version=None, cidr=None,
                  extra=None, driver=None, allocation_pools=None):
@@ -212,21 +189,6 @@ class OpenStackNetworkingConnection(OpenStackBaseConnection):
     service_region = None
     responseCls = OpenStackQuantumResponse
 
-    def request(self, action, params=None, data='', headers=None,
-                method='GET', raw=False):
-        if not headers:
-            headers = {}
-        if not params:
-            params = {}
-
-        if method in ('POST', 'PUT'):
-            headers = {'Content-Type': self.default_content_type}
-
-        return super(OpenStackNetworkingConnection, self).request(
-            action=action,
-            params=params, data=data,
-            method=method, headers=headers)
-
     def encode_data(self, data):
         """
         Encode body data.
@@ -288,11 +250,7 @@ class OpenStackNovaNetworkingDriver(NetworkingDriver, OpenStackDriverMixin):
         response = self.connection.request(self._base_path).object
         return self._to_networks_generator(response)
 
-    def create_network(self, network, subnets):
-        if len(subnets) != 1:
-            raise ValueError('You can only specify one subnet')
-
-        subnet = subnets[0]
+    def create_network(self, network, subnet):
         data = {'network': {'cidr': subnet.cidr, 'label': network.name}}
         response = self.connection.request(self._base_path,
                                            method='POST', data=data).object
@@ -398,7 +356,7 @@ class OpenStackQuantumNetworkingDriver(NetworkingDriver, OpenStackDriverMixin):
         response = self.connection.request('/v2.0/networks.json')
         return self._to_network_generator(response.object)
 
-    def create_network(self, network, subnets=None):
+    def create_network(self, network, subnet=None):
         request_data = {'network': {'name': network.name,
                                     'admin_state_up': True}}
         response = self.connection.request('/v2.0/networks.json',
@@ -407,8 +365,8 @@ class OpenStackQuantumNetworkingDriver(NetworkingDriver, OpenStackDriverMixin):
 
         network = self._to_network(response['network'])
 
-        if subnets is not None:
-            self.create_network_subnets(network=network, subnets=subnets)
+        if subnet:
+            self.create_network_subnet(network=network, subnet=subnet)
 
         return network
 
@@ -428,40 +386,21 @@ class OpenStackQuantumNetworkingDriver(NetworkingDriver, OpenStackDriverMixin):
                                            params=params).object
         return self._to_subnet_generator(response)
 
-    def create_network_subnets(self, network, subnets):
-        """
-        Create subnets on an existing Network
+    def create_network_subnet(self, network, subnet):
+        request_data = {'subnet': {'network_id': network.id,
+                                   'ip_version': subnet.ip_version,
+                                   'cidr': subnet.cidr}}
 
-        :param network: Existing Network object to operate on
-        :type network: :class:`Network`
+        if subnet.name is not None:
+            request_data['subnet']['name'] = subnet.name
 
-        :param subnets: List of subnets to create and attach to network
-        :type subnets: ``list`` of :class:`Subnet`
-
-        :return: A list of the created Subnet instances
-        :rtype: ``list`` of :class:`Subnet`
-        """
-
-        created_subnets = []
-
-        # Create each subnet individually
-        for subnet in subnets:
-            request_data = {'subnet': {'network_id': network.id,
-                                       'ip_version': subnet.ip_version,
-                                       'cidr': subnet.cidr}}
-
-            if subnet.name is not None:
-                request_data['subnet']['name'] = subnet.name
-
-            response = self.connection.request('/v2.0/subnets.json',
-                                               method='POST',
-                                               data=request_data).object
-            created_subnets.append(self._to_subnet(response['subnet']))
-
-        return created_subnets
+        response = self.connection.request('/v2.0/subnets.json',
+                                           method='POST',
+                                           data=request_data).object
+        subnet = self._to_subnet(response['subnet'])
+        return subnet
 
     def delete_subnet(self, subnet):
-        print subnet.id
         resp = self.connection.request('/v2.0/subnets/%s.json' % (subnet.id),
                                        method='DELETE')
 

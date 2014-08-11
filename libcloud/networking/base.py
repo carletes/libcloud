@@ -47,7 +47,7 @@ class FloatingIP(object):
         self.driver = driver
 
     def get_port(self):
-        return self.driver.get_port(self.port_id)
+        return self.driver.get_port(port_id=self.port_id)
 
     def __repr__(self):
         return (('<FloatingIP id=%s, floating_ip_address=%s, network_id=%s>' %
@@ -184,18 +184,18 @@ class Network(object):
     def iterate_subnets(self):
         return self.driver.iterate_network_subnets(network=self)
 
-    def create_subnets(self, subnets):
+    def create_subnet(self, subnet):
         """
-        Create subnets on this existing Network
+        Create subnet on this existing Network.
 
         :param subnets: List of subnets to create and attach to network
         :type subnets: ``list`` of :class:`Subnet`
 
-        :return: A list of the created Subnet instances
-        :rtype: ``list`` of :class:`Subnet`
+        :return: Created subnet instance.
+        :rtype: :class:`.Subnet`
         """
-        return self.driver.create_network_subnets(network=self,
-                                                  subnets=subnets)
+        return self.driver.create_network_subnet(network=self,
+                                                 subnet=subnet)
 
     def delete(self):
         """
@@ -240,16 +240,16 @@ class NetworkingDriver(BaseDriver):
         raise NotImplementedError(
             'iterate_networks not implemented for this driver')
 
-    def create_network(self, network, subnets=None):
+    def create_network(self, network, subnet=None):
         """
         Create a new network with optional subnets.
 
         :param network: Network object with at least 'name' filled in
         :type network: :class:`Network`
 
-        :param subnets: Optional list of subnets to create and attach to
-                        network
-        :type subnets: ``list`` of :class:`Subnet`
+        :param subnet: Optional subnet to create and attach to
+                       network.
+        :type subnet: :class:`.Subnet`
 
         :return: The created Network object
         :rtype: :class:`Network`
@@ -292,21 +292,21 @@ class NetworkingDriver(BaseDriver):
         raise NotImplementedError(
             'iterate_network_subnets not implemented for this driver')
 
-    def create_network_subnets(self, network, subnets):
+    def create_network_subnet(self, network, subnet):
         """
-        Create subnets on an existing Network
+        Create subnet on an existing Network,
 
         :param network: Existing Network object to operate on
         :type network: :class:`Network`
 
-        :param subnets: List of subnets to create and attach to network
-        :type subnets: ``list`` of :class:`Subnet`
+        :param subnet: Subnet to create and attach to network
+        :type subnet: class:`.Subnet`
 
         :return: A list of the created Subnet instances
         :rtype: ``list`` of :class:`Subnet`
         """
         raise NotImplementedError(
-            'create_network_subnets not implemented for this driver')
+            'create_network_subnet not implemented for this driver')
 
     def delete_subnet(self, subnet):
         """
@@ -427,7 +427,20 @@ class NetworkingDriver(BaseDriver):
         Return a generator of ports for this account.
 
         :return: A generator of Port instances.
-        :rtype: ``generator`` of :class:`Port`
+        :rtype: ``generator`` of :class:`.Port`
         """
         raise NotImplementedError(
             'iterate_ports not implemented for this driver')
+
+    def get_port(self, port_id):
+        """
+        Retrieve a port by the ID.
+
+        :param port_id: Port ID.
+        :type port_id: ``str``
+
+        :return: Port instance.
+        :rtype: :class:`.Port`
+        """
+        raise NotImplementedError(
+            'get_port not implemented for this driver')
